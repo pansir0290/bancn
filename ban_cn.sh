@@ -16,6 +16,20 @@ else
   echo "[✔] 直连 GitHub 正常。"
 fi
 
+# 自动定位 sing-box 和 xray 二进制文件路径（兼容 v2ray-agent / x-ui 等非标准路径）
+SB_BIN=$(command -v sing-box || find /etc /usr/local /opt -maxdepth 4 -type f -name "sing-box" 2>/dev/null | head -n 1)
+XRAY_BIN=$(command -v xray || find /etc /usr/local /opt -maxdepth 4 -type f -name "xray" 2>/dev/null | head -n 1)
+
+SB_VER_STR="0.0.0"
+if [ -n "$SB_BIN" ] && [ -x "$SB_BIN" ]; then
+  SB_VER_STR=$("$SB_BIN" version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+  echo "[+] 检测到 sing-box ($SB_BIN) 版本: $SB_VER_STR"
+fi
+
+if [ -n "$XRAY_BIN" ] && [ -x "$XRAY_BIN" ]; then
+  echo "[+] 检测到 Xray ($XRAY_BIN)"
+fi
+
 echo "[+] 2. 深度探测本机 Xray / sing-box 配置文件..."
 FOUND_FILES=()
 
@@ -44,12 +58,6 @@ if [ ${#FOUND_FILES[@]} -eq 0 ]; then
   exit 1
 fi
 
-SB_VER_STR="0.0.0"
-if command -v sing-box >/dev/null 2>&1; then
-  SB_VER_STR=$(sing-box version | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
-  echo "[+] 检测到 sing-box 版本: $SB_VER_STR"
-fi
-
 for config_file in "${FOUND_FILES[@]}"; do
   echo "------------------------------------------------"
   echo "[*] 处理文件: $config_file"
@@ -75,7 +83,6 @@ sb_is_new = sb_ver >= (1, 8, 0)
 with open(path, "r", encoding="utf-8") as f:
     raw = f.read()
 
-# 安全剥离注释（使用 (?<!:) 避免误伤 https:// 中的双斜杠）及尾随逗号
 clean_json = re.sub(r'(?<!:)//.*?$|/\*.*?\*/', '', raw, flags=re.MULTILINE | re.DOTALL)
 clean_json = re.sub(r',\s*([\]}])', r'\1', clean_json)
 
@@ -107,7 +114,6 @@ if is_singbox:
     
     if sb_is_new:
         data["route"].setdefault("rule_set", [])
-        
         if sb_ver >= (1, 14, 0):
             for rs in data["route"]["rule_set"]:
                 if rs.get("tag") in ("geoip-cn", "geosite-cn") and "download_detour" in rs:
@@ -191,21 +197,42 @@ PYEOF
   fi
 
   if grep -q '"route"' "$config_file"; then
-    if sing-box check -c "$config_file" >/dev/null 2>&1; then
+    if [ -z "$SB_BIN" ]; then
+      echo "[-] ⚠️ 未找到 sing-box 主程序，跳过校验并回滚原配置（可能是残留的废弃配置目录）。"
+      cp "$BACKUP_FILE" "$config_file"
+      continue
+    fi
+    if "$SB_BIN" check -c "$config_file" >/dev/null 2>&1; then
       echo "[✔] sing-box 校验通过，正在重启服务..."
       systemctl list-units --type=service --state=running | grep -oE 'sing-box[^ ]*\.service' | xargs -r systemctl restart
     else
       echo "[-] ❌ sing-box 校验失败，已自动回滚原配置！"
-      sing-box check -c "$config_file" || true
+      "$SB_BIN" check -c "$config_file" || true
       cp "$BACKUP_FILE" "$config_file"
     fi
   else
-    if xray run -test -c "$config_file" >/dev/null 2>&1; then
+    if [ -z "$XRAY_BIN" ]; then
+      echo "[-] ⚠️ 未找到 Xray 主程序，跳过校验并回滚原配置。"
+      cp "$BACKUP_FILE" "$config_file"
+      continue
+    fi
+    # 自动检查并补齐 Xray 缺失的 geoip.dat 和 geosite.dat
+    XRAY_DIR=$(dirname "$XRAY_BIN")
+    if [ ! -f "$XRAY_DIR/geoip.dat" ]; then
+      echo "[!] 检测到缺少 geoip.dat，正在自动下载到 $XRAY_DIR ..."
+      curl -fsSL "${GITHUB_PREFIX}https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" -o "$XRAY_DIR/geoip.dat" || true
+    fi
+    if [ ! -f "$XRAY_DIR/geosite.dat" ]; then
+      echo "[!] 检测到缺少 geosite.dat，正在自动下载到 $XRAY_DIR ..."
+      curl -fsSL "${GITHUB_PREFIX}https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" -o "$XRAY_DIR/geosite.dat" || true
+    fi
+
+    if "$XRAY_BIN" run -test -c "$config_file" >/dev/null 2>&1; then
       echo "[✔] Xray 校验通过，正在重启服务..."
       systemctl list-units --type=service --state=running | grep -oE 'xray[^ ]*\.service' | xargs -r systemctl restart
     else
       echo "[-] ❌ Xray 校验失败，已自动回滚原配置！"
-      xray run -test -c "$config_file" || true
+      "$XRAY_BIN" run -test -c "$config_file" || true
       cp "$BACKUP_FILE" "$config_file"
     fi
   fi
