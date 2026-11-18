@@ -1,4 +1,3 @@
-cat << 'EOF' > ban_cn.sh
 #!/bin/bash
 # 自动清理残留与错误中断设置
 trap 'rm -f /tmp/ban_cn_test.tmp' EXIT
@@ -204,4 +203,3 @@ PYEOF
 done
 echo "------------------------------------------------"
 echo "[✔] 全部处理完成。"
-EOF
