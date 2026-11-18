@@ -44,7 +44,7 @@ if [ ${#FOUND_FILES[@]} -eq 0 ]; then
   exit 1
 fi
 
-# 获取 sing-box 完整版本号字符串（交给 Python 做严格的语义化版本对比）
+# 获取 sing-box 完整版本号字符串
 SB_VER_STR="0.0.0"
 if command -v sing-box >/dev/null 2>&1; then
   SB_VER_STR=$(sing-box version | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
@@ -64,18 +64,19 @@ path = sys.argv[1]
 sb_ver_str = sys.argv[2]
 gh_prefix = sys.argv[3]
 
-# 严格的语义化版本元组对比：1.12.0 -> (1, 12, 0) >= (1, 8, 0)
 def ver_tuple(v):
     parts = [int(x) for x in re.findall(r'\d+', v)]
     while len(parts) < 3:
         parts.append(0)
     return tuple(parts[:3])
 
-sb_is_new = ver_tuple(sb_ver_str) >= (1, 8, 0)
+sb_ver = ver_tuple(sb_ver_str)
+sb_is_new = sb_ver >= (1, 8, 0)
 
 with open(path, "r", encoding="utf-8") as f:
     raw = f.read()
 
+# 剥离 JSON 中的 // 和 /* */ 注释及尾随逗号
 clean_json = re.sub(r'//.*?$|/\*.*?\*/', '', raw, flags=re.MULTILINE | re.DOTALL)
 clean_json = re.sub(r',\s*([\]}])', r'\1', clean_json)
 
@@ -107,23 +108,35 @@ if is_singbox:
     
     if sb_is_new:
         data["route"].setdefault("rule_set", [])
+        
+        # 清理旧版本可能残留的已弃用 download_detour 字段（兼容 1.14.0+ / 1.16.0+）
+        if sb_ver >= (1, 14, 0):
+            for rs in data["route"]["rule_set"]:
+                if rs.get("tag") in ("geoip-cn", "geosite-cn") and "download_detour" in rs:
+                    del rs["download_detour"]
+
         existing_tags = {rs.get("tag") for rs in data["route"]["rule_set"]}
         if "geoip-cn" not in existing_tags:
-            data["route"]["rule_set"].append({
+            rs_geoip = {
                 "tag": "geoip-cn",
                 "type": "remote",
                 "format": "binary",
-                "url": f"{gh_prefix}https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
-                "download_detour": "direct"
-            })
+                "url": f"{gh_prefix}https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
+            }
+            if sb_ver < (1, 14, 0):
+                rs_geoip["download_detour"] = "direct"
+            data["route"]["rule_set"].append(rs_geoip)
+
         if "geosite-cn" not in existing_tags:
-            data["route"]["rule_set"].append({
+            rs_geosite = {
                 "tag": "geosite-cn",
                 "type": "remote",
                 "format": "binary",
-                "url": f"{gh_prefix}https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
-                "download_detour": "direct"
-            })
+                "url": f"{gh_prefix}https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs"
+            }
+            if sb_ver < (1, 14, 0):
+                rs_geosite["download_detour"] = "direct"
+            data["route"]["rule_set"].append(rs_geosite)
         
         already = any("geoip-cn" in r.get("rule_set", []) for r in data["route"]["rules"])
         if not already:
@@ -134,7 +147,7 @@ if is_singbox:
             data["route"]["rules"] = new_rules + data["route"]["rules"]
             print(f"[+] 已注入 sing-box ({sb_ver_str} rule_set) 拦截规则")
         else:
-            print("[i] sing-box 规则已存在，无需重复注入")
+            print(f"[i] sing-box ({sb_ver_str}) 规则已存在并已清理过时参数")
     else:
         already = any("cn" in r.get("geoip", []) for r in data["route"]["rules"])
         if not already:
