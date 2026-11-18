@@ -16,6 +16,10 @@ else
   echo "[✔] 直连 GitHub 正常。"
 fi
 
+# 探测实际存在的内核二进制文件（避免处理未安装内核的残余面板配置）
+XRAY_BIN=$(command -v xray 2>/dev/null || [ -x "/usr/local/bin/xray" ] && echo "/usr/local/bin/xray" || [ -x "/etc/v2ray-agent/xray/xray" ] && echo "/etc/v2ray-agent/xray/xray" || echo "")
+SB_BIN=$(command -v sing-box 2>/dev/null || [ -x "/usr/local/bin/sing-box" ] && echo "/usr/local/bin/sing-box" || [ -x "/etc/v2ray-agent/sing-box/sing-box" ] && echo "/etc/v2ray-agent/sing-box/sing-box" || echo "")
+
 echo "[+] 2. 深度探测本机 Xray / sing-box 配置文件..."
 FOUND_FILES=()
 
@@ -26,32 +30,34 @@ while IFS= read -r cmdline; do
   fi
 done < <(ps -ef | grep -E "xray|sing-box" | grep -v grep)
 
-DEFAULT_PATHS=(
-  "/usr/local/etc/xray/config.json"
-  "/etc/xray/config.json"
-  "/etc/sing-box/config.json"
-  "/etc/v2ray-agent/sing-box/conf/config.json"
-  "/etc/v2ray-agent/xray/conf/config.json"
-)
-for p in "${DEFAULT_PATHS[@]}"; do
-  if [ -f "$p" ]; then
-    [[ " ${FOUND_FILES[*]} " =~ " ${p} " ]] || FOUND_FILES+=("$p")
-  fi
-done
+if [ -n "$XRAY_BIN" ]; then
+  for p in "/usr/local/etc/xray/config.json" "/etc/xray/config.json" "/etc/v2ray-agent/xray/conf/config.json"; do
+    if [ -f "$p" ]; then
+      [[ " ${FOUND_FILES[*]} " =~ " ${p} " ]] || FOUND_FILES+=("$p")
+    fi
+  done
+fi
+
+if [ -n "$SB_BIN" ]; then
+  for p in "/etc/sing-box/config.json" "/usr/local/etc/sing-box/config.json" "/etc/v2ray-agent/sing-box/conf/config.json"; do
+    if [ -f "$p" ]; then
+      [[ " ${FOUND_FILES[*]} " =~ " ${p} " ]] || FOUND_FILES+=("$p")
+    fi
+  done
+fi
 
 if [ ${#FOUND_FILES[@]} -eq 0 ]; then
-  echo "[-] 未检测到任何 Xray 或 sing-box 配置文件。"
+  echo "[-] 未检测到任何有效的 Xray 或 sing-box 配置文件。"
   exit 1
 fi
 
 SB_VER_STR="0.0.0"
-if command -v sing-box >/dev/null 2>&1; then
-  SB_VER_STR=$(sing-box version | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
-  echo "[+] 检测到 sing-box 版本: $SB_VER_STR"
+if [ -n "$SB_BIN" ]; then
+  SB_VER_STR=$("$SB_BIN" version | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+  echo "[+] 检测到 sing-box ($SB_BIN) 版本: $SB_VER_STR"
 fi
 
-XRAY_BIN=$(command -v xray 2>/dev/null || echo "/usr/local/bin/xray")
-XRAY_ASSET_DIR=$(dirname "$XRAY_BIN")
+XRAY_ASSET_DIR=$(dirname "${XRAY_BIN:-/usr/local/bin/xray}")
 
 for config_file in "${FOUND_FILES[@]}"; do
   echo "------------------------------------------------"
@@ -103,7 +109,6 @@ if not has_block:
     else:
         data["outbounds"].append({"protocol": "blackhole", "tag": "block"})
 
-# 自动探测当前配置中的直连出站 tag（兼容 direct / DIRECT / freedom）
 direct_tag = "direct"
 for ob in data["outbounds"]:
     if ob.get("type") == "direct" or ob.get("protocol") == "freedom":
@@ -115,7 +120,6 @@ if is_singbox:
     data.setdefault("route", {})
     data["route"].setdefault("rules", [])
     
-    # 确保测速白名单在最顶部（防止 gstatic.com 解析到 203.208.x.x 被 geoip-cn 误杀）
     has_whitelist = any("gstatic.com" in r.get("domain_suffix", []) for r in data["route"]["rules"])
     if not has_whitelist:
         data["route"]["rules"].insert(0, {
@@ -155,7 +159,6 @@ if is_singbox:
         
         already = any("geoip-cn" in r.get("rule_set", []) for r in data["route"]["rules"])
         if not already:
-            # 插在测速白名单之后
             data["route"]["rules"].insert(1, {"ip_is_private": True, "outbound": "block"})
             data["route"]["rules"].insert(2, {"rule_set": ["geoip-cn", "geosite-cn"], "outbound": "block"})
             print(f"[+] 已注入 sing-box ({sb_ver_str} rule_set + 测速白名单) 拦截规则")
@@ -210,12 +213,12 @@ PYEOF
   fi
 
   if grep -q '"route"' "$config_file"; then
-    if sing-box check -c "$config_file" >/dev/null 2>&1; then
+    if [ -n "$SB_BIN" ] && "$SB_BIN" check -c "$config_file" >/dev/null 2>&1; then
       echo "[✔] sing-box 校验通过，正在重启服务..."
       systemctl list-units --type=service --state=running | grep -oE 'sing-box[^ ]*\.service' | xargs -r systemctl restart
     else
-      echo "[-] ❌ sing-box 校验失败，已自动回滚原配置！"
-      sing-box check -c "$config_file" || true
+      echo "[-] ❌ sing-box 校验失败或未安装，已自动回滚原配置！"
+      [ -n "$SB_BIN" ] && "$SB_BIN" check -c "$config_file" || true
       cp "$BACKUP_FILE" "$config_file"
     fi
   else
@@ -228,12 +231,12 @@ PYEOF
       fi
     done
 
-    if xray run -test -c "$config_file" >/dev/null 2>&1; then
+    if [ -n "$XRAY_BIN" ] && "$XRAY_BIN" run -test -c "$config_file" >/dev/null 2>&1; then
       echo "[✔] Xray 校验通过，正在重启服务..."
       systemctl list-units --type=service --state=running | grep -oE 'xray[^ ]*\.service' | xargs -r systemctl restart
     else
       echo "[-] ❌ Xray 校验失败，已自动回滚原配置！"
-      xray run -test -c "$config_file" || true
+      [ -n "$XRAY_BIN" ] && "$XRAY_BIN" run -test -c "$config_file" || true
       cp "$BACKUP_FILE" "$config_file"
     fi
   fi
