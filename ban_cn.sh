@@ -44,7 +44,6 @@ if [ ${#FOUND_FILES[@]} -eq 0 ]; then
   exit 1
 fi
 
-# 获取 sing-box 完整版本号字符串
 SB_VER_STR="0.0.0"
 if command -v sing-box >/dev/null 2>&1; then
   SB_VER_STR=$(sing-box version | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
@@ -76,12 +75,12 @@ sb_is_new = sb_ver >= (1, 8, 0)
 with open(path, "r", encoding="utf-8") as f:
     raw = f.read()
 
-# 剥离 JSON 中的 // 和 /* */ 注释及尾随逗号
-clean_json = re.sub(r'//.*?$|/\*.*?\*/', '', raw, flags=re.MULTILINE | re.DOTALL)
+# 安全剥离注释（使用 (?<!:) 避免误伤 https:// 中的双斜杠）及尾随逗号
+clean_json = re.sub(r'(?<!:)//.*?$|/\*.*?\*/', '', raw, flags=re.MULTILINE | re.DOTALL)
 clean_json = re.sub(r',\s*([\]}])', r'\1', clean_json)
 
 try:
-    data = json.loads(clean_json)
+    data = json.loads(clean_json, strict=False)
 except Exception as e:
     print(f"[-] JSON 解析失败 ({e})，跳过此文件。")
     sys.exit(2)
@@ -109,7 +108,6 @@ if is_singbox:
     if sb_is_new:
         data["route"].setdefault("rule_set", [])
         
-        # 清理旧版本可能残留的已弃用 download_detour 字段（兼容 1.14.0+ / 1.16.0+）
         if sb_ver >= (1, 14, 0):
             for rs in data["route"]["rule_set"]:
                 if rs.get("tag") in ("geoip-cn", "geosite-cn") and "download_detour" in rs:
