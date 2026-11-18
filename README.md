@@ -8,4 +8,4 @@
 
 ### 1. 标准运行（自带防 CDN 缓存与执行后自动清理）
 ```bash
-rm -f ban_cn.sh && curl -sL "[https://raw.githubusercontent.com/pansir0290/bancn/main/ban_cn.sh?v=$(date](https://raw.githubusercontent.com/pansir0290/bancn/main/ban_cn.sh?v=$(date) +%s)" -o ban_cn.sh && chmod +x ban_cn.sh && ./ban_cn.sh && rm -f ban_cn.sh
+rm -f ban_cn.sh && curl -sL "https://raw.githubusercontent.com/pansir0290/bancn/main/ban_cn.sh?v=$(date +%s)" -o ban_cn.sh && chmod +x ban_cn.sh && ./ban_cn.sh && rm -f ban_cn.sh
