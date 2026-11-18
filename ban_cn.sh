@@ -1,5 +1,4 @@
 #!/bin/bash
-# 自动清理残留与错误中断设置
 trap 'rm -f /tmp/ban_cn_test.tmp' EXIT
 set -e
 
@@ -20,7 +19,6 @@ fi
 echo "[+] 2. 深度探测本机 Xray / sing-box 配置文件..."
 FOUND_FILES=()
 
-# 从运行中的进程参数提取配置文件路径
 while IFS= read -r cmdline; do
   cfg=$(echo "$cmdline" | grep -oE '(-c|--config|-confdir)[= ]+[^ ]+' | awk '{print $NF}' | tr -d '"' | tr -d "'")
   if [ -f "$cfg" ]; then
@@ -28,7 +26,6 @@ while IFS= read -r cmdline; do
   fi
 done < <(ps -ef | grep -E "xray|sing-box" | grep -v grep)
 
-# 补充常见默认路径
 DEFAULT_PATHS=(
   "/usr/local/etc/xray/config.json"
   "/etc/xray/config.json"
@@ -47,13 +44,11 @@ if [ ${#FOUND_FILES[@]} -eq 0 ]; then
   exit 1
 fi
 
-# 获取 sing-box 版本（判断是否为 1.8.0+ 新版语法）
-SB_IS_NEW=0
+# 获取 sing-box 完整版本号字符串（交给 Python 做严格的语义化版本对比）
+SB_VER_STR="0.0.0"
 if command -v sing-box >/dev/null 2>&1; then
-  SB_VER=$(sing-box version | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
-  if awk "BEGIN {exit !($SB_VER >= 1.8)}"; then
-    SB_IS_NEW=1
-  fi
+  SB_VER_STR=$(sing-box version | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+  echo "[+] 检测到 sing-box 版本: $SB_VER_STR"
 fi
 
 for config_file in "${FOUND_FILES[@]}"; do
@@ -62,17 +57,25 @@ for config_file in "${FOUND_FILES[@]}"; do
   BACKUP_FILE="${config_file}.bak_$(date +%Y%m%d%H%M%S)"
   cp "$config_file" "$BACKUP_FILE"
 
-  python3 - "$config_file" "$SB_IS_NEW" "$GITHUB_PREFIX" << 'PYEOF'
+  python3 - "$config_file" "$SB_VER_STR" "$GITHUB_PREFIX" << 'PYEOF'
 import json, re, sys
 
 path = sys.argv[1]
-sb_is_new = int(sys.argv[2])
+sb_ver_str = sys.argv[2]
 gh_prefix = sys.argv[3]
+
+# 严格的语义化版本元组对比：1.12.0 -> (1, 12, 0) >= (1, 8, 0)
+def ver_tuple(v):
+    parts = [int(x) for x in re.findall(r'\d+', v)]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+sb_is_new = ver_tuple(sb_ver_str) >= (1, 8, 0)
 
 with open(path, "r", encoding="utf-8") as f:
     raw = f.read()
 
-# 剥离 JSON 中的 // 和 /* */ 注释及尾随逗号
 clean_json = re.sub(r'//.*?$|/\*.*?\*/', '', raw, flags=re.MULTILINE | re.DOTALL)
 clean_json = re.sub(r',\s*([\]}])', r'\1', clean_json)
 
@@ -82,13 +85,11 @@ except Exception as e:
     print(f"[-] JSON 解析失败 ({e})，跳过此文件。")
     sys.exit(2)
 
-# 判断内核类型
 is_singbox = ("route" in data) or any(
     isinstance(i, dict) and "type" in i and "protocol" not in i 
     for i in data.get("inbounds", [])
 )
 
-# 1. 确保存在 block 出站
 data.setdefault("outbounds", [])
 has_block = any(
     ob.get("tag") == "block" or ob.get("protocol") == "blackhole" or ob.get("type") == "block"
@@ -100,12 +101,11 @@ if not has_block:
     else:
         data["outbounds"].append({"protocol": "blackhole", "tag": "block"})
 
-# 2. 注入路由规则
 if is_singbox:
     data.setdefault("route", {})
     data["route"].setdefault("rules", [])
     
-    if sb_is_new == 1:
+    if sb_is_new:
         data["route"].setdefault("rule_set", [])
         existing_tags = {rs.get("tag") for rs in data["route"]["rule_set"]}
         if "geoip-cn" not in existing_tags:
@@ -132,7 +132,7 @@ if is_singbox:
                 {"rule_set": ["geoip-cn", "geosite-cn"], "outbound": "block"}
             ]
             data["route"]["rules"] = new_rules + data["route"]["rules"]
-            print("[+] 已注入 sing-box (1.8+ rule_set) 拦截规则")
+            print(f"[+] 已注入 sing-box ({sb_ver_str} rule_set) 拦截规则")
         else:
             print("[i] sing-box 规则已存在，无需重复注入")
     else:
@@ -143,7 +143,7 @@ if is_singbox:
                 {"geosite": ["cn"], "outbound": "block"}
             ]
             data["route"]["rules"] = new_rules + data["route"]["rules"]
-            print("[+] 已注入 sing-box (旧版 geoip) 拦截规则")
+            print(f"[+] 已注入 sing-box ({sb_ver_str} 旧版 geoip) 拦截规则")
 else:
     data.setdefault("routing", {})
     data["routing"]["domainStrategy"] = "IPIfNonMatch"
@@ -160,7 +160,6 @@ else:
     else:
         print("[i] Xray 规则已存在，无需重复注入")
 
-# 识别原文件缩进
 indent = 2
 for line in raw.splitlines():
     if line.startswith("    "):
@@ -180,7 +179,6 @@ PYEOF
     continue
   fi
 
-  # 3. 校验配置并平滑重启对应服务
   if grep -q '"route"' "$config_file"; then
     if sing-box check -c "$config_file" >/dev/null 2>&1; then
       echo "[✔] sing-box 校验通过，正在重启服务..."
