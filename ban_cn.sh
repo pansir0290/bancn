@@ -1,5 +1,5 @@
 #!/bin/bash
-trap 'rm -f /tmp/ban_cn_test.tmp' EXIT
+trap 'rm -f /tmp/ban_cn_test.tmp /tmp/geoip.dat /tmp/geosite.dat' EXIT
 set -e
 
 if [ "$EUID" -ne 0 ]; then
@@ -14,20 +14,6 @@ if ! curl -sI --connect-timeout 3 https://raw.githubusercontent.com >/dev/null 2
   GITHUB_PREFIX="https://gh-proxy.com/"
 else
   echo "[✔] 直连 GitHub 正常。"
-fi
-
-# 自动定位 sing-box 和 xray 二进制文件路径（兼容 v2ray-agent / x-ui 等非标准路径）
-SB_BIN=$(command -v sing-box || find /etc /usr/local /opt -maxdepth 4 -type f -name "sing-box" 2>/dev/null | head -n 1)
-XRAY_BIN=$(command -v xray || find /etc /usr/local /opt -maxdepth 4 -type f -name "xray" 2>/dev/null | head -n 1)
-
-SB_VER_STR="0.0.0"
-if [ -n "$SB_BIN" ] && [ -x "$SB_BIN" ]; then
-  SB_VER_STR=$("$SB_BIN" version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
-  echo "[+] 检测到 sing-box ($SB_BIN) 版本: $SB_VER_STR"
-fi
-
-if [ -n "$XRAY_BIN" ] && [ -x "$XRAY_BIN" ]; then
-  echo "[+] 检测到 Xray ($XRAY_BIN)"
 fi
 
 echo "[+] 2. 深度探测本机 Xray / sing-box 配置文件..."
@@ -57,6 +43,15 @@ if [ ${#FOUND_FILES[@]} -eq 0 ]; then
   echo "[-] 未检测到任何 Xray 或 sing-box 配置文件。"
   exit 1
 fi
+
+SB_VER_STR="0.0.0"
+if command -v sing-box >/dev/null 2>&1; then
+  SB_VER_STR=$(sing-box version | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+  echo "[+] 检测到 sing-box 版本: $SB_VER_STR"
+fi
+
+XRAY_BIN=$(command -v xray 2>/dev/null || echo "/usr/local/bin/xray")
+XRAY_ASSET_DIR=$(dirname "$XRAY_BIN")
 
 for config_file in "${FOUND_FILES[@]}"; do
   echo "------------------------------------------------"
@@ -108,10 +103,26 @@ if not has_block:
     else:
         data["outbounds"].append({"protocol": "blackhole", "tag": "block"})
 
+# 自动探测当前配置中的直连出站 tag（兼容 direct / DIRECT / freedom）
+direct_tag = "direct"
+for ob in data["outbounds"]:
+    if ob.get("type") == "direct" or ob.get("protocol") == "freedom":
+        if ob.get("tag"):
+            direct_tag = ob["tag"]
+            break
+
 if is_singbox:
     data.setdefault("route", {})
     data["route"].setdefault("rules", [])
     
+    # 确保测速白名单在最顶部（防止 gstatic.com 解析到 203.208.x.x 被 geoip-cn 误杀）
+    has_whitelist = any("gstatic.com" in r.get("domain_suffix", []) for r in data["route"]["rules"])
+    if not has_whitelist:
+        data["route"]["rules"].insert(0, {
+            "domain_suffix": ["gstatic.com", "googleapis.com"],
+            "outbound": direct_tag
+        })
+
     if sb_is_new:
         data["route"].setdefault("rule_set", [])
         if sb_ver >= (1, 14, 0):
@@ -128,7 +139,7 @@ if is_singbox:
                 "url": f"{gh_prefix}https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
             }
             if sb_ver < (1, 14, 0):
-                rs_geoip["download_detour"] = "direct"
+                rs_geoip["download_detour"] = direct_tag
             data["route"]["rule_set"].append(rs_geoip)
 
         if "geosite-cn" not in existing_tags:
@@ -139,43 +150,45 @@ if is_singbox:
                 "url": f"{gh_prefix}https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs"
             }
             if sb_ver < (1, 14, 0):
-                rs_geosite["download_detour"] = "direct"
+                rs_geosite["download_detour"] = direct_tag
             data["route"]["rule_set"].append(rs_geosite)
         
         already = any("geoip-cn" in r.get("rule_set", []) for r in data["route"]["rules"])
         if not already:
-            new_rules = [
-                {"ip_is_private": True, "outbound": "block"},
-                {"rule_set": ["geoip-cn", "geosite-cn"], "outbound": "block"}
-            ]
-            data["route"]["rules"] = new_rules + data["route"]["rules"]
-            print(f"[+] 已注入 sing-box ({sb_ver_str} rule_set) 拦截规则")
+            # 插在测速白名单之后
+            data["route"]["rules"].insert(1, {"ip_is_private": True, "outbound": "block"})
+            data["route"]["rules"].insert(2, {"rule_set": ["geoip-cn", "geosite-cn"], "outbound": "block"})
+            print(f"[+] 已注入 sing-box ({sb_ver_str} rule_set + 测速白名单) 拦截规则")
         else:
-            print(f"[i] sing-box ({sb_ver_str}) 规则已存在并已清理过时参数")
+            print(f"[i] sing-box ({sb_ver_str}) 规则已存在，已补全测速白名单")
     else:
         already = any("cn" in r.get("geoip", []) for r in data["route"]["rules"])
         if not already:
-            new_rules = [
-                {"geoip": ["private", "cn"], "outbound": "block"},
-                {"geosite": ["cn"], "outbound": "block"}
-            ]
-            data["route"]["rules"] = new_rules + data["route"]["rules"]
-            print(f"[+] 已注入 sing-box ({sb_ver_str} 旧版 geoip) 拦截规则")
+            data["route"]["rules"].insert(1, {"geoip": ["private", "cn"], "outbound": "block"})
+            data["route"]["rules"].insert(2, {"geosite": ["cn"], "outbound": "block"})
+            print(f"[+] 已注入 sing-box ({sb_ver_str} 旧版 geoip + 测速白名单) 拦截规则")
+        else:
+            print(f"[i] sing-box ({sb_ver_str}) 规则已存在，已补全测速白名单")
 else:
     data.setdefault("routing", {})
     data["routing"]["domainStrategy"] = "IPIfNonMatch"
     data["routing"].setdefault("rules", [])
     
+    has_whitelist = any("domain:gstatic.com" in r.get("domain", []) for r in data["routing"]["rules"])
+    if not has_whitelist:
+        data["routing"]["rules"].insert(0, {
+            "type": "field",
+            "domain": ["domain:gstatic.com", "domain:googleapis.com"],
+            "outboundTag": direct_tag
+        })
+
     already = any("geoip:cn" in r.get("ip", []) for r in data["routing"]["rules"])
     if not already:
-        new_rules = [
-            {"type": "field", "ip": ["geoip:private", "geoip:cn"], "outboundTag": "block"},
-            {"type": "field", "domain": ["geosite:cn"], "outboundTag": "block"}
-        ]
-        data["routing"]["rules"] = new_rules + data["routing"]["rules"]
-        print("[+] 已注入 Xray 拦截规则 (IPIfNonMatch)")
+        data["routing"]["rules"].insert(1, {"type": "field", "ip": ["geoip:private", "geoip:cn"], "outboundTag": "block"})
+        data["routing"]["rules"].insert(2, {"type": "field", "domain": ["geosite:cn"], "outboundTag": "block"})
+        print("[+] 已注入 Xray 拦截规则 (IPIfNonMatch + 测速白名单)")
     else:
-        print("[i] Xray 规则已存在，无需重复注入")
+        print("[i] Xray 规则已存在，已补全测速白名单")
 
 indent = 2
 for line in raw.splitlines():
@@ -197,42 +210,30 @@ PYEOF
   fi
 
   if grep -q '"route"' "$config_file"; then
-    if [ -z "$SB_BIN" ]; then
-      echo "[-] ⚠️ 未找到 sing-box 主程序，跳过校验并回滚原配置（可能是残留的废弃配置目录）。"
-      cp "$BACKUP_FILE" "$config_file"
-      continue
-    fi
-    if "$SB_BIN" check -c "$config_file" >/dev/null 2>&1; then
+    if sing-box check -c "$config_file" >/dev/null 2>&1; then
       echo "[✔] sing-box 校验通过，正在重启服务..."
       systemctl list-units --type=service --state=running | grep -oE 'sing-box[^ ]*\.service' | xargs -r systemctl restart
     else
       echo "[-] ❌ sing-box 校验失败，已自动回滚原配置！"
-      "$SB_BIN" check -c "$config_file" || true
+      sing-box check -c "$config_file" || true
       cp "$BACKUP_FILE" "$config_file"
     fi
   else
-    if [ -z "$XRAY_BIN" ]; then
-      echo "[-] ⚠️ 未找到 Xray 主程序，跳过校验并回滚原配置。"
-      cp "$BACKUP_FILE" "$config_file"
-      continue
-    fi
-    # 自动检查并补齐 Xray 缺失的 geoip.dat 和 geosite.dat
-    XRAY_DIR=$(dirname "$XRAY_BIN")
-    if [ ! -f "$XRAY_DIR/geoip.dat" ]; then
-      echo "[!] 检测到缺少 geoip.dat，正在自动下载到 $XRAY_DIR ..."
-      curl -fsSL "${GITHUB_PREFIX}https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" -o "$XRAY_DIR/geoip.dat" || true
-    fi
-    if [ ! -f "$XRAY_DIR/geosite.dat" ]; then
-      echo "[!] 检测到缺少 geosite.dat，正在自动下载到 $XRAY_DIR ..."
-      curl -fsSL "${GITHUB_PREFIX}https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" -o "$XRAY_DIR/geosite.dat" || true
-    fi
+    [ -L "$XRAY_ASSET_DIR" ] && [ ! -e "$XRAY_ASSET_DIR" ] && rm -f "$XRAY_ASSET_DIR"
+    mkdir -p "$XRAY_ASSET_DIR"
+    for dat in geoip.dat geosite.dat; do
+      if [ ! -s "$XRAY_ASSET_DIR/$dat" ]; then
+        echo "[!] 检测到缺少 $dat，正在通过 /tmp 中转下载到 $XRAY_ASSET_DIR ..."
+        curl -fL "${GITHUB_PREFIX}https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/${dat}" -o "/tmp/${dat}" && mv -f "/tmp/${dat}" "$XRAY_ASSET_DIR/$dat" || true
+      fi
+    done
 
-    if "$XRAY_BIN" run -test -c "$config_file" >/dev/null 2>&1; then
+    if xray run -test -c "$config_file" >/dev/null 2>&1; then
       echo "[✔] Xray 校验通过，正在重启服务..."
       systemctl list-units --type=service --state=running | grep -oE 'xray[^ ]*\.service' | xargs -r systemctl restart
     else
       echo "[-] ❌ Xray 校验失败，已自动回滚原配置！"
-      "$XRAY_BIN" run -test -c "$config_file" || true
+      xray run -test -c "$config_file" || true
       cp "$BACKUP_FILE" "$config_file"
     fi
   fi
