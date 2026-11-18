@@ -16,9 +16,22 @@ else
   echo "[✔] 直连 GitHub 正常。"
 fi
 
-# 探测实际存在的内核二进制文件（避免处理未安装内核的残余面板配置）
-XRAY_BIN=$(command -v xray 2>/dev/null || [ -x "/usr/local/bin/xray" ] && echo "/usr/local/bin/xray" || [ -x "/etc/v2ray-agent/xray/xray" ] && echo "/etc/v2ray-agent/xray/xray" || echo "")
-SB_BIN=$(command -v sing-box 2>/dev/null || [ -x "/usr/local/bin/sing-box" ] && echo "/usr/local/bin/sing-box" || [ -x "/etc/v2ray-agent/sing-box/sing-box" ] && echo "/etc/v2ray-agent/sing-box/sing-box" || echo "")
+# 用循环干净获取单个有效的二进制路径，避免多行字符串拼接
+XRAY_BIN=""
+for p in "$(command -v xray 2>/dev/null)" "/usr/local/bin/xray" "/etc/v2ray-agent/xray/xray"; do
+  if [ -n "$p" ] && [ -x "$p" ]; then
+    XRAY_BIN="$p"
+    break
+  fi
+done
+
+SB_BIN=""
+for p in "$(command -v sing-box 2>/dev/null)" "/usr/local/bin/sing-box" "/etc/v2ray-agent/sing-box/sing-box"; do
+  if [ -n "$p" ] && [ -x "$p" ]; then
+    SB_BIN="$p"
+    break
+  fi
+done
 
 echo "[+] 2. 深度探测本机 Xray / sing-box 配置文件..."
 FOUND_FILES=()
